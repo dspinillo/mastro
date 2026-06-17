@@ -5,8 +5,12 @@ import sys
 import textwrap
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from maestro_cli import cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +25,21 @@ def run(args, cwd, *, input_text=None, env=None):
         [sys.executable, "-m", "maestro_cli.cli", *args],
         cwd=cwd,
         input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=merged_env,
+    )
+
+
+def start(args, cwd, *, env=None):
+    merged_env = os.environ.copy()
+    merged_env["PYTHONPATH"] = str(ROOT)
+    if env:
+        merged_env.update(env)
+    return subprocess.Popen(
+        [sys.executable, "-m", "maestro_cli.cli", *args],
+        cwd=cwd,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -283,15 +302,26 @@ class MaestroCliTests(unittest.TestCase):
         self.assertTrue(worktree.exists())
         self.assertEqual(self.workspace("task-dirty")["status"], "completed")
 
-    def test_missing_worktree_reconciles_to_orphaned(self):
-        proc = run(["run", "--agent", "fake", "--branch", "task/orphan", "--prompt", "prompt.txt"], self.repo)
+    def test_running_workspace_missing_worktree_reconciles_to_orphaned(self):
+        proc = run(["run", "--agent", "slow", "--branch", "task/orphan", "--prompt", "prompt.txt", "--detach"], self.repo)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_for_status("task-orphan", "running")
         worktree = Path(run(["open", "task-orphan"], self.repo).stdout.strip())
         git(self.repo, "worktree", "remove", "--force", str(worktree))
         ls_proc = run(["--json", "ls"], self.repo)
         self.assertEqual(ls_proc.returncode, 0, ls_proc.stderr)
         ws = next(item for item in json.loads(ls_proc.stdout) if item["id"] == "task-orphan")
         self.assertEqual(ws["status"], "orphaned")
+
+    def test_reconcile_does_not_orphan_completed_workspace_on_missing_worktree(self):
+        proc = run(["run", "--agent", "fake", "--branch", "task/completed-missing", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        worktree = Path(run(["open", "task-completed-missing"], self.repo).stdout.strip())
+        git(self.repo, "worktree", "remove", "--force", str(worktree))
+        ls_proc = run(["--json", "ls"], self.repo)
+        self.assertEqual(ls_proc.returncode, 0, ls_proc.stderr)
+        ws = next(item for item in json.loads(ls_proc.stdout) if item["id"] == "task-completed-missing")
+        self.assertEqual(ws["status"], "completed")
 
     def test_invalid_recipe_fails_before_creating_worktree(self):
         self.write_config(
@@ -308,14 +338,133 @@ class MaestroCliTests(unittest.TestCase):
         self.assertFalse((self.repo / ".maestro" / "worktrees" / "task-invalid").exists())
         self.assertNotEqual(git(self.repo, "rev-parse", "--verify", "refs/heads/task/invalid", check=False).returncode, 0)
 
-    def test_corrupt_state_is_backed_up_before_run_recreates_state(self):
+    def test_corrupt_state_fails_closed_for_all_commands(self):
+        proc = run(["run", "--agent", "fake", "--branch", "task/corrupt-seed", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         state_path = self.repo / ".maestro" / "state.json"
         state_path.write_text("{not json")
-        proc = run(["run", "--agent", "fake", "--branch", "task/corrupt-state", "--prompt", "prompt.txt"], self.repo)
+        commands = [
+            ["ls"],
+            ["run", "--agent", "fake", "--branch", "task/corrupt-state", "--prompt", "prompt.txt"],
+            ["logs", "task-corrupt-seed"],
+            ["open", "task-corrupt-seed"],
+            ["stop", "task-corrupt-seed"],
+            ["rm", "task-corrupt-seed"],
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = run(command, self.repo)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("malformed state file", result.stderr)
+                self.assertIn("git worktree list", result.stderr)
+                self.assertEqual(state_path.read_text(), "{not json")
+                self.assertEqual(list((self.repo / ".maestro").glob("state.json.corrupt-*")), [])
+        self.assertNotEqual(git(self.repo, "rev-parse", "--verify", "refs/heads/task/corrupt-state", check=False).returncode, 0)
+
+    def test_defaults_agent_config_is_used_when_agent_not_passed(self):
+        self.write_config(
+            f"""\
+            [defaults]
+            agent = "fake"
+
+            [agents.fake]
+            command = "{self.fake_agent}"
+            args = ["--prompt", "{{prompt}}"]
+            prompt_via = "arg"
+            """
+        )
+        proc = run(["run", "--branch", "task/default-agent", "--prompt", "prompt.txt"], self.repo)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        backups = list((self.repo / ".maestro").glob("state.json.corrupt-*"))
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(self.workspace("task-corrupt-state")["status"], "completed")
+        self.assertIn("fake agent ran", proc.stdout)
+        self.assertEqual(self.workspace("task-default-agent")["agent"], "fake")
+
+    def test_ctrl_c_after_worktree_add_rolls_back_branch_and_worktree(self):
+        args = SimpleNamespace(
+            agent="fake",
+            branch="task/interrupted",
+            prompt="prompt.txt",
+            base="HEAD",
+            name=None,
+            detach=False,
+            setup=None,
+            extra_args=[],
+            config=None,
+            json=False,
+        )
+        original_cwd = Path.cwd()
+        original_run_cmd = cli.run_cmd
+
+        def interrupt_after_worktree_add(cmd, **kwargs):
+            result = original_run_cmd(cmd, **kwargs)
+            if len(cmd) > 4 and cmd[0] == "git" and "worktree" in cmd and "add" in cmd:
+                raise KeyboardInterrupt
+            return result
+
+        try:
+            os.chdir(self.repo)
+            with mock.patch.object(cli, "run_cmd", side_effect=interrupt_after_worktree_add):
+                with self.assertRaises(KeyboardInterrupt):
+                    cli.cmd_run(args)
+        finally:
+            os.chdir(original_cwd)
+
+        self.assertFalse((self.repo / ".maestro" / "worktrees" / "task-interrupted").exists())
+        self.assertNotEqual(git(self.repo, "rev-parse", "--verify", "refs/heads/task/interrupted", check=False).returncode, 0)
+        state_path = self.repo / ".maestro" / "state.json"
+        if state_path.exists():
+            self.assertEqual(json.loads(state_path.read_text())["workspaces"], [])
+
+    def test_concurrent_runs_for_same_branch_preserve_winner(self):
+        first = start(["run", "--agent", "fake", "--branch", "task/race", "--prompt", "prompt.txt"], self.repo)
+        second = start(["run", "--agent", "fake", "--branch", "task/race", "--prompt", "prompt.txt"], self.repo)
+        first_out, first_err = first.communicate(timeout=10)
+        second_out, second_err = second.communicate(timeout=10)
+        results = [(first.returncode, first_out, first_err), (second.returncode, second_out, second_err)]
+        self.assertEqual(sum(1 for code, _, _ in results if code == 0), 1, results)
+        self.assertEqual(sum(1 for code, _, _ in results if code != 0), 1, results)
+        loser_err = next(err for code, _, err in results if code != 0)
+        self.assertTrue("branch already exists" in loser_err or "workspace id already exists" in loser_err, loser_err)
+        state = self.state()
+        self.assertEqual([ws["id"] for ws in state["workspaces"]], ["task-race"])
+        self.assertTrue((self.repo / ".maestro" / "worktrees" / "task-race").exists())
+        self.assertEqual(git(self.repo, "rev-parse", "--verify", "refs/heads/task/race").returncode, 0)
+
+    def test_config_dirs_must_not_point_inside_git_or_match(self):
+        cases = [
+            (
+                f"""\
+                [defaults]
+                worktree_dir = ".git/worktrees"
+                log_dir = "custom/logs"
+                """,
+                "must not point inside .git",
+            ),
+            (
+                f"""\
+                [defaults]
+                worktree_dir = "same"
+                log_dir = "same"
+                """,
+                "must be different paths",
+            ),
+        ]
+        for index, (defaults, message) in enumerate(cases):
+            with self.subTest(message=message):
+                self.write_config(
+                    defaults
+                    + f"""
+
+                    [agents.fake]
+                    command = "{self.fake_agent}"
+                    args = ["--prompt", "{{prompt}}"]
+                    prompt_via = "arg"
+                    """
+                )
+                branch = f"task/bad-dir-{index}"
+                proc = run(["run", "--agent", "fake", "--branch", branch, "--prompt", "prompt.txt"], self.repo)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(message, proc.stderr)
+                self.assertNotEqual(git(self.repo, "rev-parse", "--verify", f"refs/heads/{branch}", check=False).returncode, 0)
 
 
 if __name__ == "__main__":
