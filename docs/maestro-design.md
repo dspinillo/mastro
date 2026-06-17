@@ -5,6 +5,11 @@
 
 Status: **Draft v0.1** · Audience: maintainers & early contributors
 
+> **Implementation note (2026-06-17):** v0.1 shipped as the Python package `maestro-cli`
+> (`maestro_cli/`). Where this draft disagrees with [`maestro-v0.1-spec.md`](maestro-v0.1-spec.md)
+> on behavior, **the spec wins**. Known drift: §5 `--keep-branch` → v0.1 uses `--delete-branch`
+> (opt-in); §8 language recommendation vs Python delivery.
+
 ---
 
 ## 1. Verdict: Is the idea technically sound?
@@ -217,7 +222,7 @@ maestro ls [--status <s>] [--json]      # list workspaces + status
 maestro logs <id> [-f] [-n <lines>]      # print/tail logs
 maestro open <id>                        # print worktree path (for cd/subshell)
 maestro stop <id>                        # terminate the running agent
-maestro rm <id> [--force] [--keep-branch]# remove worktree (+ optionally branch)
+maestro rm <id> [--force] [--delete-branch]  # remove worktree; branch deletion is opt-in
 ```
 
 ### v0.2+ commands (designed now, built later)

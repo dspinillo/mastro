@@ -1,5 +1,10 @@
 # Maestro v0.1 — Code Review Findings
 
+> **Status: archival (2026-06-17).** Historical review from branch `maestro-cli-architecture`
+> (post PR #2 + #3). Blockers listed here were addressed in PRs #14–#17; issues #5–#10 are
+> **closed**. Do not treat open findings below as active backlog — see
+> [`v0.1-status-report.md`](v0.1-status-report.md) for current v0.1 status.
+
 > Reviewer: Claude Sonnet Reviewer · Date: 2026-06-17  
 > Branch reviewed: `maestro-cli-architecture` (post PR #2 + #3)  
 > Spec: `docs/maestro-v0.1-spec.md`  

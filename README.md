@@ -3,6 +3,9 @@
 Terminal-first orchestrator for running CLI coding agents in parallel across isolated
 [git worktrees](https://git-scm.com/docs/git-worktree).
 
+> **Note:** The product is **Maestro** (`maestro-cli`). This GitHub repository is still
+> named [`mastro`](https://github.com/dspinillo/mastro); a repo rename is planned separately.
+
 **v0.1 commands:** `run`, `ls`, `logs`, `open`, `stop`, `rm`
 
 ## Quick start
@@ -41,14 +44,17 @@ Configure agents in `.maestro/config.toml` (committable). See the
 | Doc | Audience |
 |---|---|
 | [**Practical Guide**](docs/maestro-guide.md) | Day-to-day usage, examples, recovery |
+| [v0.1 Status Report](docs/v0.1-status-report.md) | Final v0.1 audit (2026-06-17) |
 | [v0.1 Spec](docs/maestro-v0.1-spec.md) | Normative implementation reference |
 | [Design Doc](docs/maestro-design.md) | Architecture, risks, roadmap |
 
 ## Tests
 
+Official test suite (20 tests):
+
 ```sh
+python3 -m unittest -v
 python3 -m pytest -q
-# or: python3 -m unittest -v
 ```
 
 ## What Maestro is not
