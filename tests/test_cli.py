@@ -291,6 +291,19 @@ class MaestroCliTests(unittest.TestCase):
         self.assertIn("removed worktree and branch task/delete-me", rm_proc.stdout)
         self.assertNotEqual(git(self.repo, "rev-parse", "--verify", "refs/heads/task/delete-me", check=False).returncode, 0)
 
+    def test_rm_delete_branch_tolerates_manually_deleted_branch(self):
+        proc = run(["run", "--agent", "fake", "--branch", "task/deleted-branch", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        worktree = Path(run(["open", "task-deleted-branch"], self.repo).stdout.strip())
+        git(worktree, "switch", "--detach")
+        git(self.repo, "branch", "-D", "task/deleted-branch")
+
+        rm_proc = run(["rm", "task-deleted-branch", "--delete-branch"], self.repo)
+        self.assertEqual(rm_proc.returncode, 0, rm_proc.stderr)
+        self.assertIn("branch task/deleted-branch already absent", rm_proc.stdout)
+        self.assertFalse(worktree.exists())
+        self.assertEqual(self.state()["workspaces"], [])
+
     def test_dirty_worktree_blocks_rm_without_force(self):
         proc = run(["run", "--agent", "fake", "--branch", "task/dirty", "--prompt", "prompt.txt"], self.repo)
         self.assertEqual(proc.returncode, 0, proc.stderr)
