@@ -183,8 +183,10 @@ Multiple `maestro` processes can run simultaneously (parallel agents).
 
 ### 1.8 Validation rules (load time)
 
-On load, Maestro MUST validate and, on violation, refuse to mutate (read-only
-commands MAY proceed with a warning):
+On load, Maestro MUST validate every rule below. A violation makes the file
+**invalid**; handling is defined by the fail-closed paragraph that follows this
+list (it applies to **all** commands, read-only included — there is no "proceed
+with a warning" path):
 - `version == 1`.
 - Every `id` matches the id regex and is unique.
 - Every `branch` is non-empty.
