@@ -194,6 +194,26 @@ args = ["exec", "{prompt}", "--full-auto"]
 args = ["--prompt", "{prompt}", "--yolo"]
 ```
 
+### Custom `worktree_dir` and `log_dir`
+
+v0.1 supports non-default directories under the repo root (Decision
+[`0001-custom-worktree-log-dirs.md`](decisions/0001-custom-worktree-log-dirs.md)):
+
+```toml
+[defaults]
+worktree_dir = "custom/worktrees"
+log_dir = "custom/logs"
+```
+
+Rules enforced at config load:
+
+- Paths must be **relative** to the repo root (no absolute paths, no `..`).
+- Paths must **not** resolve inside `.git`.
+- `worktree_dir` and `log_dir` must be **different**.
+
+Maestro appends both directories to `.gitignore` on first `run`. Logs and prompts
+land under the configured `log_dir/<id>/`; worktrees under `worktree_dir/<id>/`.
+
 ---
 
 ## Commands (v0.1)
@@ -223,6 +243,7 @@ maestro run \
   [-- <extra agent args>]
 ```
 
+- **`--agent`** — agent recipe name. Optional if `defaults.agent` is set in config.
 - **`--branch`** — new branch created in a new worktree (must not already exist).
 - **`--prompt`** — path to a prompt file, or `-` to read from stdin.
 - **`--base`** — ref to branch from (default: `HEAD`).
@@ -415,24 +436,29 @@ maestro rm <id>              # tolerates missing worktree dir
 git -C /path/to/repo worktree prune
 ```
 
-### `state.json` corrupted
+### `state.json` corrupted or invalid
 
-On **`run`** (mutating command), Maestro backs up the bad file to
-`.maestro/state.json.corrupt-<timestamp>`, starts from an empty state, and prints a warning.
+Maestro v0.1 is **fail-closed** on invalid `state.json` (spec §1.8, E16): **every**
+command — including read-only ones like `ls` and `logs` — exits non-zero with a
+message naming the file and pointing to `git worktree list`. Maestro does **not**
+auto-backup, truncate, or recreate the file.
 
 Recovery steps:
 
-1. Inspect the backup and any remaining worktrees:
+1. Inspect the file and any remaining worktrees:
 
 ```sh
+cat .maestro/state.json
 git -C /path/to/repo worktree list
 ls -la .maestro/worktrees/
 ```
 
-2. Remove stale Maestro entries or re-run tasks as needed.
-3. Manually merge recovered workspace metadata from the backup only if you understand the JSON schema (see spec Part 1).
+2. Repair or replace `state.json` manually (schema in spec Part 1), **or** delete
+   it only after confirming no Maestro-managed workspaces need tracking.
+3. Use `git worktree list` as the source of truth for orphaned worktrees.
 
-**Note:** `ls` and other read commands currently **fail** on corrupt state instead of auto-repairing. Use `run` once to trigger backup + reset, or restore/fix `state.json` by hand.
+Logs and prompts under `.maestro/logs/<id>/` (or a custom `log_dir`) survive
+independently of `state.json`.
 
 ### Find logs and saved prompt
 
@@ -498,24 +524,30 @@ Detached `run` without `--json` prints only the workspace id on stdout.
 ## Further reading
 
 - [`maestro-v0.1-spec.md`](maestro-v0.1-spec.md) — normative schema, reconciliation, edge cases
-- [`maestro-design.md`](maestro-design.md) — architecture, non-goals, roadmap
+- [`maestro-design.md`](maestro-design.md) — architecture, risks, roadmap (draft; spec wins on behavior)
+- [`v0.1-status-report.md`](v0.1-status-report.md) — final v0.1 audit status (2026-06-17)
+- [`decisions/0001-custom-worktree-log-dirs.md`](decisions/0001-custom-worktree-log-dirs.md) — custom dir support
 
 ---
 
-## Pendências para engenharia
+## Limitações conhecidas e drift documental
 
-Inconsistências observadas entre documentação anterior e a implementação v0.1 atual
-(revisão pós-fixes do Codex Builder):
+Itens ainda válidos após o fechamento de issues #5–#10 e PRs #14–#17:
 
-| # | Área | Spec / design doc | Implementação atual |
-|---|---|---|---|
-| 1 | Flag de branch em `rm` | Design doc §5 cita `--keep-branch` | v0.1 usa `--delete-branch` (opt-in); spec prevalece |
-| 2 | `--agent` default | Design doc §5 e config `defaults.agent` sugerem agente opcional | CLI exige `--agent` (`required=True`); fallback em código nunca é alcançado |
-| 3 | Linguagem | Design doc §8 recomenda Go | v0.1 entregue em Python (`maestro-cli`) |
-| 4 | Supervisor detached | Spec §1.6 / §3.2 descreve double-fork | Re-exec via subcomando interno `_supervise` + `subprocess.Popen` |
-| 5 | PID reuse guard | Spec §1.6.1 (best-effort start-time check) | Apenas probe de liveness (`kill(pid, 0)`); limitação documentada acima |
-| 6 | Logs em `rm --force` | Spec §3.6: `--force` MAY apagar logs | Logs sempre retidos após `rm` |
-| 7 | `state.json` corrupto | Spec §1.8: comandos read-only MAY continuar com warning | `ls`/`logs`/etc. falham (`repair_corrupt=False`); só `run` faz backup + reset |
-| 8 | Nome do repositório | README anterior: "Mastro" | Produto/comando: **Maestro** (`maestro-cli`) |
-| 9 | Instalação editable | — | `pip install -e .` falha com pip/setuptools antigos; documentado workaround via `PYTHONPATH` |
-| 10 | Saída de `run --detach` | Spec exemplo §3.8: mensagem estilo `created workspace:` | Imprime só o workspace id (ou JSON com `--json`) |
+| # | Área | Notas |
+|---|---|---|
+| 1 | Design doc §8 | Recomenda Go; v0.1 entregue em Python (`maestro-cli`) |
+| 2 | Supervisor detached | Spec descreve double-fork; implementação usa re-exec via `_supervise` (oculto de `--help`) |
+| 3 | PID reuse | Apenas probe de liveness; sem checagem de start-time (spec §1.6.1 MAY); ver seção acima |
+| 4 | Logs em `rm --force` | Spec §3.6: MAY apagar logs; implementação sempre retém |
+| 5 | Saída de `run --detach` | Imprime workspace id (ou JSON com `--json`); spec §3.8 usa mensagem `created workspace:` |
+| 6 | Nome repo vs produto | Produto/comando: **Maestro**; repositório GitHub/paths locais ainda **mastro** |
+| 7 | Instalação editable | `pip install -e .` pode falhar com pip/setuptools antigos; usar `PYTHONPATH` ou `pip install .` |
+
+Itens **resolvidos** na main atual (não tratar como backlog):
+
+- Fail-closed em `state.json` corrupto (#6, PR #16/#17)
+- `defaults.agent` como fallback quando `--agent` omitido (M1)
+- Reconcile não reclassifica workspaces terminais como `orphaned` (H1)
+- Custom `worktree_dir` / `log_dir` suportados (Decision 0001, issue #7 fechada)
+- `_supervise` oculto da UX pública (issue #9 fechada)

@@ -1,5 +1,9 @@
 # Codex Builder Brief — v0.1 fixes
 
+> **Status: completed (2026-06-17).** All blockers (B0–B5) and optional hardening (B6) were
+> implemented and merged to `main` via PRs #14–#17. This brief is kept for traceability only.
+> Current status: [`v0.1-status-report.md`](v0.1-status-report.md).
+
 > Author: Claude Staff Engineer · Date: 2026-06-17
 > Pairs with: PR #13 (review findings) + Decision 0001 (custom dirs)
 > Base branch: `main` · Open the implementation PR with `gh pr create --base main`
