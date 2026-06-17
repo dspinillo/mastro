@@ -984,17 +984,18 @@ def cmd_rm(args: argparse.Namespace) -> int:
     run_cmd(["git", "-C", str(root), "worktree", "prune"], check=False)
     branch_deleted = False
     if args.delete_branch:
-        delete_flag = "-D" if args.force else "-d"
-        proc = run_cmd(["git", "-C", str(root), "branch", delete_flag, ws["branch"]], check=False)
-        if proc.returncode != 0 and "not found" not in proc.stderr.lower():
-            raise MaestroError(proc.stderr.strip())
-        branch_deleted = proc.returncode == 0
+        if branch_exists(root, ws["branch"]):
+            delete_flag = "-D" if args.force else "-d"
+            run_cmd(["git", "-C", str(root), "branch", delete_flag, ws["branch"]])
+            branch_deleted = True
     with store.lock():
         state = store.read()
         state["workspaces"] = [item for item in state["workspaces"] if item["id"] != args.id]
         store.write(state)
     if args.delete_branch and branch_deleted:
         print(f"removed worktree and branch {ws['branch']}")
+    elif args.delete_branch:
+        print(f"removed worktree for {args.id} (branch {ws['branch']} already absent)")
     else:
         print(f"removed worktree for {args.id} (branch {ws['branch']} kept)")
     return 0

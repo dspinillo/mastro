@@ -463,6 +463,15 @@ maestro stop <id>
 # last resort: kill PID from maestro ls --json, then maestro ls again
 ```
 
+### PID reuse limitation
+
+Maestro v0.1 checks whether a recorded agent process is alive with a bare
+`kill(pid, 0)`-style liveness probe. It does not compare the recorded
+`run.started_at` value with the operating system process start time. On systems
+that quickly reuse process IDs, `maestro ls` can temporarily treat a reused PID
+as the original agent process; once that PID exits, normal sentinel/orphan
+reconciliation applies. This is the v0.1 limitation allowed by spec §1.6.1.
+
 ### Dirty worktree blocks `rm`
 
 ```sh
@@ -504,7 +513,7 @@ Inconsistências observadas entre documentação anterior e a implementação v0
 | 2 | `--agent` default | Design doc §5 e config `defaults.agent` sugerem agente opcional | CLI exige `--agent` (`required=True`); fallback em código nunca é alcançado |
 | 3 | Linguagem | Design doc §8 recomenda Go | v0.1 entregue em Python (`maestro-cli`) |
 | 4 | Supervisor detached | Spec §1.6 / §3.2 descreve double-fork | Re-exec via subcomando interno `_supervise` + `subprocess.Popen` |
-| 5 | PID reuse guard | Spec §1.6.1 (best-effort start-time check) | Apenas probe de liveness (`kill(pid, 0)`) |
+| 5 | PID reuse guard | Spec §1.6.1 (best-effort start-time check) | Apenas probe de liveness (`kill(pid, 0)`); limitação documentada acima |
 | 6 | Logs em `rm --force` | Spec §3.6: `--force` MAY apagar logs | Logs sempre retidos após `rm` |
 | 7 | `state.json` corrupto | Spec §1.8: comandos read-only MAY continuar com warning | `ls`/`logs`/etc. falham (`repair_corrupt=False`); só `run` faz backup + reset |
 | 8 | Nome do repositório | README anterior: "Mastro" | Produto/comando: **Maestro** (`maestro-cli`) |
