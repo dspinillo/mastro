@@ -316,7 +316,7 @@ class StateStore:
         now = utcnow()
         return {"version": 1, "updated_at": now, "workspaces": []}
 
-    def read(self, *, repair_corrupt: bool = True) -> dict[str, Any]:
+    def read(self, *, repair_corrupt: bool = False) -> dict[str, Any]:
         if not self.path.exists():
             return self.empty_state()
         try:
@@ -324,12 +324,10 @@ class StateStore:
             validate_state(state)
             return state
         except Exception as exc:
-            if not repair_corrupt:
-                raise MaestroError(f"malformed state file: {self.path}") from exc
-            backup = self.path.with_name(f"state.json.corrupt-{utcnow().replace(':', '-')}")
-            shutil.copy2(self.path, backup)
-            eprint(f"warning: backed up malformed state to {backup}")
-            return self.empty_state()
+            raise MaestroError(
+                f"malformed state file: {self.path}; refusing to continue. "
+                "Inspect or repair the file manually; use `git worktree list` to recover worktrees."
+            ) from exc
 
     def write(self, state: dict[str, Any]) -> None:
         self.ensure_dirs()
@@ -421,18 +419,17 @@ def reconcile_state(root: Path, state: dict[str, Any]) -> bool:
     now = utcnow()
     for ws in state["workspaces"]:
         run = ws.get("run")
+        if ws.get("status") != "running" or not run:
+            continue
         if not Path(ws["worktree_path"]).exists():
             if ws["status"] == "orphaned":
                 continue
             ws["status"] = "orphaned"
-            if run:
-                run["pid"] = None
-                if not run.get("ended_at"):
-                    run["ended_at"] = now
+            run["pid"] = None
+            if not run.get("ended_at"):
+                run["ended_at"] = now
             ws["updated_at"] = now
             changed = True
-            continue
-        if ws.get("status") != "running" or not run:
             continue
         if run.get("pid") is None and run.get("ended_at") is None:
             try:
@@ -508,11 +505,23 @@ def update_workspace(root: Path, wid: str, mutator) -> dict[str, Any]:
         return ws
 
 
-def relative_config_dir(value: str, field: str) -> Path:
+def relative_config_dir(root: Path, value: str, field: str) -> Path:
     path = Path(value)
     if path.is_absolute() or ".." in path.parts:
         raise MaestroError(f"defaults.{field} must be a relative path inside the repo")
+    resolved = (root / path).resolve()
+    git_dir = (root / ".git").resolve()
+    if resolved == git_dir or git_dir in resolved.parents:
+        raise MaestroError(f"defaults.{field} must not point inside .git")
     return path
+
+
+def default_dirs(root: Path, defaults: dict[str, Any]) -> tuple[Path, Path]:
+    worktree_dir = relative_config_dir(root, defaults.get("worktree_dir", ".maestro/worktrees"), "worktree_dir")
+    log_dir = relative_config_dir(root, defaults.get("log_dir", ".maestro/logs"), "log_dir")
+    if worktree_dir == log_dir:
+        raise MaestroError("defaults.worktree_dir and defaults.log_dir must be different paths")
+    return worktree_dir, log_dir
 
 
 def gitignore_dir(path: Path) -> str:
@@ -522,8 +531,7 @@ def gitignore_dir(path: Path) -> str:
 def append_gitignore_if_needed(root: Path, defaults: dict[str, Any]) -> None:
     store = StateStore(root)
     store.ensure_dirs()
-    worktree_dir = relative_config_dir(defaults.get("worktree_dir", ".maestro/worktrees"), "worktree_dir")
-    log_dir = relative_config_dir(defaults.get("log_dir", ".maestro/logs"), "log_dir")
+    worktree_dir, log_dir = default_dirs(root, defaults)
     store.ensure_gitignore([gitignore_dir(worktree_dir), gitignore_dir(log_dir)])
 
 
@@ -702,6 +710,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     validate_branch(args.branch)
     config = load_config(root, args.config)
     agent = args.agent or config.get("defaults", {}).get("agent")
+    if not agent:
+        raise MaestroError("agent is required; pass --agent or set defaults.agent")
     recipe = resolve_recipe(config, agent)
     validate_recipe(agent, recipe)
     prompt_bytes, prompt_meta = resolve_prompt(args.prompt)
@@ -710,11 +720,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not ID_RE.match(wid):
         raise MaestroError(f"invalid workspace id: {wid}")
     defaults = config.get("defaults", {})
-    worktree_dir = relative_config_dir(defaults.get("worktree_dir", ".maestro/worktrees"), "worktree_dir")
-    log_dir = relative_config_dir(defaults.get("log_dir", ".maestro/logs"), "log_dir")
+    worktree_dir, log_dir = default_dirs(root, defaults)
     worktree_path = (root / worktree_dir / wid).resolve()
     base_sha = run_cmd(["git", "-C", str(root), "rev-parse", "--verify", f"{args.base}^{{commit}}"]).stdout.strip()
-    append_gitignore_if_needed(root, defaults)
     store = StateStore(root)
     created = False
     log_abs: Path | None = None
@@ -728,37 +736,36 @@ def cmd_run(args: argparse.Namespace) -> int:
                 raise MaestroError(f"branch already exists: {args.branch}; choose a different --branch")
             if worktree_path.exists():
                 raise MaestroError(f"worktree path already exists: {worktree_path}")
-        run_cmd(["git", "-C", str(root), "worktree", "add", "-b", args.branch, str(worktree_path), base_sha])
-        created = True
-        log_abs, log_rel = materialize_log_paths(root, log_dir.as_posix(), wid)
-        prompt_file = log_abs.parent / "prompt.txt"
-        prompt_file.write_bytes(prompt_bytes)
-        now = utcnow()
-        ws = {
-            "id": wid,
-            "branch": args.branch,
-            "base": {"ref": args.base, "sha": base_sha},
-            "worktree_path": str(worktree_path),
-            "agent": agent,
-            "prompt": prompt_meta,
-            "status": "running",
-            "run": {
-                "pid": None,
-                "detached": bool(args.detach),
-                "started_at": now,
-                "ended_at": None,
-                "exit_code": None,
-                "log_path": log_rel,
-                "command": [],
-            },
-            "created_at": now,
-            "updated_at": now,
-            "maestro_version": __version__,
-        }
-        with store.lock():
-            state = store.read()
+            created = True
+            run_cmd(["git", "-C", str(root), "worktree", "add", "-b", args.branch, str(worktree_path), base_sha])
+            log_abs, log_rel = materialize_log_paths(root, log_dir.as_posix(), wid)
+            prompt_file = log_abs.parent / "prompt.txt"
+            prompt_file.write_bytes(prompt_bytes)
+            now = utcnow()
+            ws = {
+                "id": wid,
+                "branch": args.branch,
+                "base": {"ref": args.base, "sha": base_sha},
+                "worktree_path": str(worktree_path),
+                "agent": agent,
+                "prompt": prompt_meta,
+                "status": "running",
+                "run": {
+                    "pid": None,
+                    "detached": bool(args.detach),
+                    "started_at": now,
+                    "ended_at": None,
+                    "exit_code": None,
+                    "log_path": log_rel,
+                    "command": [],
+                },
+                "created_at": now,
+                "updated_at": now,
+                "maestro_version": __version__,
+            }
             state["workspaces"].append(ws)
             store.write(state)
+        append_gitignore_if_needed(root, defaults)
         setup = args.setup if args.setup is not None else recipe.get("setup")
         if setup:
             with log_abs.open("ab") as log:
@@ -804,15 +811,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 0
         print(f"created workspace: {wid}   (branch {args.branch})")
         return supervise_foreground(root, wid, argv, env, stdin_prompt)
-    except Exception:
-        if created and log_abs is not None:
-            with contextlib.suppress(Exception):
-                state = store.read()
-                if not any(ws["id"] == wid and ws.get("status") == "failed" for ws in state["workspaces"]):
-                    with store.lock():
-                        state = store.read()
+    except BaseException:
+        if created:
+            with contextlib.suppress(BaseException):
+                with store.lock():
+                    state = store.read()
+                    if not any(ws["id"] == wid and ws.get("status") == "failed" for ws in state["workspaces"]):
                         state["workspaces"] = [ws for ws in state["workspaces"] if ws["id"] != wid]
                         store.write(state)
+            with contextlib.suppress(BaseException):
+                state = store.read()
+                preserve_setup_failure = any(ws["id"] == wid and ws.get("status") == "failed" for ws in state["workspaces"])
+                if not preserve_setup_failure:
                     rollback_workspace(root, args.branch, worktree_path)
         raise
 
@@ -999,7 +1009,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_p = sub.add_parser("run")
-    run_p.add_argument("--agent", required=True)
+    run_p.add_argument("--agent")
     run_p.add_argument("--branch", required=True)
     run_p.add_argument("--prompt", required=True)
     run_p.add_argument("--base", default="HEAD")

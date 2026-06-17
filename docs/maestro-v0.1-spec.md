@@ -190,10 +190,12 @@ commands MAY proceed with a warning):
 - Every `branch` is non-empty.
 - `worktree_path` is absolute.
 - `status` ∈ the enum.
-- `run.log_path` is relative (no leading `/`, no `..` escaping `.maestro/logs`).
+- `run.log_path` is relative (no leading `/`, no `..` escaping the repo root).
 - Timestamps parse as RFC3339.
-A malformed `state.json` MUST NOT be silently overwritten; Maestro SHOULD back it
-up to `state.json.corrupt-<timestamp>` before recreating, and tell the user.
+A malformed `state.json` MUST fail closed: every command, including read-only
+commands, MUST abort non-zero with a message that names the state file and points
+the user to `git worktree list` for recovery context. Maestro MUST NOT
+automatically copy, truncate, overwrite, or replace an invalid state file.
 
 ---
 
@@ -471,7 +473,7 @@ Steps:
 | E13 | Two `run`s race for the same `id`/branch | State lock + the branch-exists/path-exists checks serialize them; the loser errors per E1/E3. |
 | E14 | `setup` hook hangs | `run` blocks; Ctrl-C → rollback per §3.2 (remove worktree+branch). No automatic timeout in v0.1. |
 | E15 | Agent binary not on PATH | Detected at step 2/10 before/at spawn; if before worktree creation, nothing created; if the recipe was valid but binary vanished, fail spawn → `status = failed`, worktree preserved. |
-| E16 | `.maestro/state.json` corrupt | Back up to `state.json.corrupt-<ts>`, recreate empty, warn (§1.8). Existing worktrees become invisible to Maestro until manually reconciled — document `git worktree list` as the recovery aid. |
+| E16 | `.maestro/state.json` corrupt | Fail closed: every command aborts non-zero with an actionable message naming the state file and pointing to `git worktree list`; do not copy, truncate, overwrite, or replace the file (§1.8). |
 | E17 | Nested repo / submodule cwd | Use `git rev-parse --show-toplevel`; operate on the resolved root. Submodule worktrees are out of scope for v0.1. |
 
 ### 3.8 Worked example (end-to-end)
