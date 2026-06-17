@@ -1,0 +1,11 @@
+[project]
+name = "maestro-cli"
+version = "0.1.0"
+description = "Terminal-first orchestrator for CLI coding agents across git worktrees."
+requires-python = ">=3.10"
+
+[project.scripts]
+maestro = "maestro_cli.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
