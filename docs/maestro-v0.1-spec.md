@@ -27,6 +27,16 @@ Conventions:
   matching entry is absent. (`.maestro/config.toml` is NOT ignored — it is committable.)
 - The file is the source of truth for "which workspaces exist," but every read
   MUST be **reconciled** against git and process reality (see §1.6).
+- **v0.1 directory limitation:** worktrees live at
+  `<repo-root>/.maestro/worktrees/<id>` and logs at
+  `<repo-root>/.maestro/logs/<id>/` — these locations are **fixed**.
+  `defaults.worktree_dir` and `defaults.log_dir` are **reserved** config keys: if
+  either is present with a value other than its default, `run` MUST abort with
+  `"custom worktree_dir/log_dir is not supported in v0.1"`. A fixed `.maestro/logs`
+  prefix is what makes the §1.8 `run.log_path` containment invariant trivially
+  enforceable and keeps prompt-file materialization unambiguous. Configurable
+  locations are deferred to a later version (to be implemented with prefix-derived
+  validation and path-containment checks for both directories).
 
 ### 1.2 Top-level shape
 
@@ -192,8 +202,17 @@ commands MAY proceed with a warning):
 - `status` ∈ the enum.
 - `run.log_path` is relative (no leading `/`, no `..` escaping `.maestro/logs`).
 - Timestamps parse as RFC3339.
-A malformed `state.json` MUST NOT be silently overwritten; Maestro SHOULD back it
-up to `state.json.corrupt-<timestamp>` before recreating, and tell the user.
+A `state.json` that fails to parse or violates any rule above is **invalid**. On
+encountering an invalid state file, **every** command (read-only and mutating
+alike) MUST abort with a non-zero exit and a message that (a) names the file,
+(b) states that worktrees and branches are unaffected and listable via
+`git worktree list`, and (c) instructs the user to inspect the file or move it
+aside. Maestro MUST NOT automatically back up, truncate, recreate, or otherwise
+mutate an invalid state file — recreating an empty state is a destructive write,
+triggered by malformed input, that discards the only record linking each
+workspace `id` to its branch, worktree, logs, and prompt hash. Failing closed
+loses nothing recoverable: the worktrees and branches survive in git. (An
+explicit, user-initiated repair/reset command is out of scope for v0.1.)
 
 ---
 
@@ -350,9 +369,9 @@ prior steps where noted.
    returns empty). Collisions → error (suggest `--name` / different `--branch`).
 5. **Resolve base.** `git rev-parse --verify <base>^{commit}` → full SHA. Default
    `--base` is `HEAD`. Unresolvable ref → error.
-6. **Compute worktree path:** `<repo-root>/<defaults.worktree_dir>/<id>`
-   (default `.maestro/worktrees/<id>`). The path MUST NOT already exist; if it
-   does → error.
+6. **Compute worktree path:** `<repo-root>/.maestro/worktrees/<id>` (fixed in
+   v0.1; `defaults.worktree_dir`/`defaults.log_dir` are reserved and a non-default
+   value MUST abort here per §1.1). The path MUST NOT already exist; if it does → error.
 7. **Create the worktree + branch:**
    `git -C <repo-root> worktree add -b <branch> <worktree_path> <base-sha>`.
    On failure → abort (nothing to roll back yet). On success continue.
@@ -471,7 +490,7 @@ Steps:
 | E13 | Two `run`s race for the same `id`/branch | State lock + the branch-exists/path-exists checks serialize them; the loser errors per E1/E3. |
 | E14 | `setup` hook hangs | `run` blocks; Ctrl-C → rollback per §3.2 (remove worktree+branch). No automatic timeout in v0.1. |
 | E15 | Agent binary not on PATH | Detected at step 2/10 before/at spawn; if before worktree creation, nothing created; if the recipe was valid but binary vanished, fail spawn → `status = failed`, worktree preserved. |
-| E16 | `.maestro/state.json` corrupt | Back up to `state.json.corrupt-<ts>`, recreate empty, warn (§1.8). Existing worktrees become invisible to Maestro until manually reconciled — document `git worktree list` as the recovery aid. |
+| E16 | `.maestro/state.json` invalid/corrupt | **All** commands fail closed: non-zero exit, actionable message (§1.8). No automatic backup, truncation, or recreation. Worktrees and branches remain intact; `git worktree list` is the recovery aid. |
 | E17 | Nested repo / submodule cwd | Use `git rev-parse --show-toplevel`; operate on the resolved root. Submodule worktrees are out of scope for v0.1. |
 
 ### 3.8 Worked example (end-to-end)

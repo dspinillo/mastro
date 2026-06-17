@@ -256,8 +256,8 @@ whitespace footguns (vs YAML), less verbose than JSON. Layered resolution:
 ```toml
 [defaults]
 agent = "claude"
-worktree_dir = ".maestro/worktrees"
-log_dir = ".maestro/logs"
+worktree_dir = ".maestro/worktrees"  # reserved in v0.1: must equal the default (see v0.1 spec §1.1)
+log_dir = ".maestro/logs"            # reserved in v0.1: must equal the default (see v0.1 spec §1.1)
 
 # An agent recipe = how to invoke a CLI agent non-interactively.
 [agents.claude]
