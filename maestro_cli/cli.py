@@ -30,7 +30,7 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 TOKEN_RE = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
 VALID_TOKENS = {"{prompt}", "{prompt_file}", "{branch}", "{workspace}", "{base}", "{worktree}"}
 VALID_STATUSES = {"running", "completed", "failed", "stopped", "orphaned"}
-GITIGNORE_ENTRIES = [".maestro/state.json", ".maestro/logs/", ".maestro/worktrees/"]
+DEFAULT_GITIGNORE_ENTRIES = [".maestro/state.json", ".maestro/logs/", ".maestro/worktrees/"]
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "defaults": {
@@ -276,10 +276,11 @@ class StateStore:
         (self.root / ".maestro" / "logs").mkdir(exist_ok=True)
         (self.root / ".maestro" / "worktrees").mkdir(exist_ok=True)
 
-    def ensure_gitignore(self) -> None:
+    def ensure_gitignore(self, extra_entries: list[str] | None = None) -> None:
         gitignore = self.root / ".gitignore"
         existing = gitignore.read_text().splitlines() if gitignore.exists() else []
-        additions = [entry for entry in GITIGNORE_ENTRIES if entry not in existing]
+        entries = list(dict.fromkeys(DEFAULT_GITIGNORE_ENTRIES + list(extra_entries or [])))
+        additions = [entry for entry in entries if entry not in existing]
         if additions:
             with gitignore.open("a") as f:
                 if existing and existing[-1] != "":
@@ -377,7 +378,7 @@ def validate_state(state: dict[str, Any]) -> None:
         run = ws.get("run")
         if run:
             log_path = run.get("log_path", "")
-            if Path(log_path).is_absolute() or ".." in Path(log_path).parts or not log_path.startswith(".maestro/logs/"):
+            if not log_path or Path(log_path).is_absolute() or ".." in Path(log_path).parts:
                 raise MaestroError(f"workspace {wid} has invalid run.log_path")
             parse_time(run.get("started_at", ""))
             if run.get("ended_at"):
@@ -419,15 +420,19 @@ def reconcile_state(root: Path, state: dict[str, Any]) -> bool:
     changed = False
     now = utcnow()
     for ws in state["workspaces"]:
-        if ws.get("status") != "running" or not ws.get("run"):
-            continue
-        run = ws["run"]
+        run = ws.get("run")
         if not Path(ws["worktree_path"]).exists():
+            if ws["status"] == "orphaned":
+                continue
             ws["status"] = "orphaned"
-            run["pid"] = None
-            run["ended_at"] = now
+            if run:
+                run["pid"] = None
+                if not run.get("ended_at"):
+                    run["ended_at"] = now
             ws["updated_at"] = now
             changed = True
+            continue
+        if ws.get("status") != "running" or not run:
             continue
         if run.get("pid") is None and run.get("ended_at") is None:
             try:
@@ -503,10 +508,23 @@ def update_workspace(root: Path, wid: str, mutator) -> dict[str, Any]:
         return ws
 
 
-def append_gitignore_if_needed(root: Path) -> None:
+def relative_config_dir(value: str, field: str) -> Path:
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise MaestroError(f"defaults.{field} must be a relative path inside the repo")
+    return path
+
+
+def gitignore_dir(path: Path) -> str:
+    return path.as_posix().rstrip("/") + "/"
+
+
+def append_gitignore_if_needed(root: Path, defaults: dict[str, Any]) -> None:
     store = StateStore(root)
     store.ensure_dirs()
-    store.ensure_gitignore()
+    worktree_dir = relative_config_dir(defaults.get("worktree_dir", ".maestro/worktrees"), "worktree_dir")
+    log_dir = relative_config_dir(defaults.get("log_dir", ".maestro/logs"), "log_dir")
+    store.ensure_gitignore([gitignore_dir(worktree_dir), gitignore_dir(log_dir)])
 
 
 def rollback_workspace(root: Path, branch: str, worktree_path: Path) -> None:
@@ -528,7 +546,7 @@ def resolve_prompt(path: str) -> tuple[bytes, dict[str, Any]]:
 def build_process(root: Path, ws: dict[str, Any], recipe: dict[str, Any], prompt_text: str, extra_args: list[str]) -> tuple[list[str], list[str], dict[str, str]]:
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
-    prompt_file = root / ".maestro" / "logs" / ws["id"] / "prompt.txt"
+    prompt_file = (root / ws["run"]["log_path"]).parent / "prompt.txt"
     values = {
         "{prompt}": prompt_text,
         "{prompt_file}": str(prompt_file.resolve()),
@@ -692,9 +710,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not ID_RE.match(wid):
         raise MaestroError(f"invalid workspace id: {wid}")
     defaults = config.get("defaults", {})
-    worktree_path = (root / defaults.get("worktree_dir", ".maestro/worktrees") / wid).resolve()
+    worktree_dir = relative_config_dir(defaults.get("worktree_dir", ".maestro/worktrees"), "worktree_dir")
+    log_dir = relative_config_dir(defaults.get("log_dir", ".maestro/logs"), "log_dir")
+    worktree_path = (root / worktree_dir / wid).resolve()
     base_sha = run_cmd(["git", "-C", str(root), "rev-parse", "--verify", f"{args.base}^{{commit}}"]).stdout.strip()
-    append_gitignore_if_needed(root)
+    append_gitignore_if_needed(root, defaults)
     store = StateStore(root)
     created = False
     log_abs: Path | None = None
@@ -710,7 +730,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 raise MaestroError(f"worktree path already exists: {worktree_path}")
         run_cmd(["git", "-C", str(root), "worktree", "add", "-b", args.branch, str(worktree_path), base_sha])
         created = True
-        log_abs, log_rel = materialize_log_paths(root, defaults.get("log_dir", ".maestro/logs"), wid)
+        log_abs, log_rel = materialize_log_paths(root, log_dir.as_posix(), wid)
         prompt_file = log_abs.parent / "prompt.txt"
         prompt_file.write_bytes(prompt_bytes)
         now = utcnow()
@@ -761,7 +781,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             payload_fd, payload_name = tempfile.mkstemp(prefix="maestro-supervise.", suffix=".json", dir=root / ".maestro")
             with os.fdopen(payload_fd, "w") as f:
                 json.dump({"root": str(root), "id": wid, "argv": argv, "env": env, "prompt_hex": stdin_prompt.hex() if stdin_prompt else ""}, f)
-            subprocess.Popen([sys.executable, "-m", "maestro_cli.cli", "_supervise", "--payload", payload_name], cwd=root, start_new_session=True)
+            subprocess.Popen(
+                [sys.executable, "-m", "maestro_cli.cli", "_supervise", "--payload", payload_name],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
             deadline = time.time() + 5
             while time.time() < deadline:
                 with store.lock():
@@ -1005,15 +1033,23 @@ def build_parser() -> argparse.ArgumentParser:
     rm_p.add_argument("--delete-branch", action="store_true")
     rm_p.set_defaults(func=cmd_rm)
 
-    sup_p = sub.add_parser("_supervise")
-    sup_p.add_argument("--payload", required=True)
-    sup_p.set_defaults(func=cmd_supervise)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv and raw_argv[0] == "_supervise":
+        parser = argparse.ArgumentParser(prog="maestro _supervise")
+        parser.add_argument("_command")
+        parser.add_argument("--payload", required=True)
+        args = parser.parse_args(raw_argv)
+        try:
+            return cmd_supervise(args)
+        except MaestroError as exc:
+            eprint(f"maestro: {exc}")
+            return 1
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     try:
         return args.func(args)
     except KeyboardInterrupt:

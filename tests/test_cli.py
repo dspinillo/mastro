@@ -64,21 +64,83 @@ class MaestroCliTests(unittest.TestCase):
             )
         )
         self.fake_agent.chmod(0o755)
-        (self.repo / ".maestro").mkdir()
-        (self.repo / ".maestro" / "config.toml").write_text(
+        self.slow_agent = self.bin / "slow-agent"
+        self.slow_agent.write_text(
             textwrap.dedent(
-                f"""\
-                [agents.fake]
-                command = "{self.fake_agent}"
-                args = ["--prompt", "{{prompt}}"]
-                prompt_via = "arg"
+                """\
+                #!/usr/bin/env python3
+                import time
+                print("slow agent started", flush=True)
+                time.sleep(30)
                 """
             )
         )
+        self.slow_agent.chmod(0o755)
+        self.fail_agent = self.bin / "fail-agent"
+        self.fail_agent.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import sys
+                print("fail agent ran")
+                sys.exit(7)
+                """
+            )
+        )
+        self.fail_agent.chmod(0o755)
+        (self.repo / ".maestro").mkdir()
+        self.write_config()
         (self.repo / "prompt.txt").write_text("add tests please\n")
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def write_config(self, body=None):
+        if body is None:
+            body = f"""\
+            [agents.fake]
+            command = "{self.fake_agent}"
+            args = ["--prompt", "{{prompt}}"]
+            prompt_via = "arg"
+
+            [agents.slow]
+            command = "{self.slow_agent}"
+            args = ["--prompt", "{{prompt}}"]
+            prompt_via = "arg"
+
+            [agents.fail]
+            command = "{self.fail_agent}"
+            args = ["--prompt", "{{prompt}}"]
+            prompt_via = "arg"
+
+            [agents.stdin]
+            command = "{self.fake_agent}"
+            args = []
+            prompt_via = "stdin"
+            """
+        (self.repo / ".maestro" / "config.toml").write_text(textwrap.dedent(body))
+
+    def state(self):
+        return json.loads((self.repo / ".maestro" / "state.json").read_text())
+
+    def workspace(self, workspace_id):
+        for item in self.state()["workspaces"]:
+            if item["id"] == workspace_id:
+                return item
+        raise AssertionError(f"workspace not found: {workspace_id}")
+
+    def wait_for_status(self, workspace_id, status, timeout=5):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            ls_proc = run(["--json", "ls"], self.repo)
+            self.assertEqual(ls_proc.returncode, 0, ls_proc.stderr)
+            workspaces = json.loads(ls_proc.stdout)
+            last = next((item for item in workspaces if item["id"] == workspace_id), None)
+            if last and last["status"] == status:
+                return last
+            time.sleep(0.1)
+        self.fail(f"workspace {workspace_id} did not reach {status}; last={last}")
 
     def test_run_records_completed_workspace_and_logs(self):
         proc = run(["run", "--agent", "fake", "--branch", "task/add-tests", "--prompt", "prompt.txt"], self.repo)
@@ -138,20 +200,122 @@ class MaestroCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "task-detached")
 
-        deadline = time.time() + 5
-        final_state = None
-        while time.time() < deadline:
-            ls_proc = run(["--json", "ls"], self.repo)
-            self.assertEqual(ls_proc.returncode, 0, ls_proc.stderr)
-            final_state = json.loads(ls_proc.stdout)[0]
-            if final_state["status"] == "completed":
-                break
-            time.sleep(0.1)
-
-        self.assertIsNotNone(final_state)
+        final_state = self.wait_for_status("task-detached", "completed")
         self.assertEqual(final_state["status"], "completed")
         self.assertEqual(final_state["run"]["exit_code"], 0)
         self.assertTrue((self.repo / final_state["run"]["log_path"]).with_suffix(".exit").exists())
+
+    def test_custom_worktree_and_log_dirs_are_supported(self):
+        self.write_config(
+            f"""\
+            [defaults]
+            worktree_dir = "custom/worktrees"
+            log_dir = "custom/logs"
+
+            [agents.fake]
+            command = "{self.fake_agent}"
+            args = ["--prompt", "{{prompt}}"]
+            prompt_via = "arg"
+            """
+        )
+        proc = run(["run", "--agent", "fake", "--branch", "task/custom-dirs", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        ws = self.workspace("task-custom-dirs")
+        self.assertEqual(ws["status"], "completed")
+        self.assertTrue((self.repo / "custom" / "worktrees" / "task-custom-dirs").exists())
+        self.assertTrue(ws["run"]["log_path"].startswith("custom/logs/task-custom-dirs/"))
+        self.assertTrue((self.repo / ws["run"]["log_path"]).exists())
+        self.assertTrue((self.repo / "custom" / "logs" / "task-custom-dirs" / "prompt.txt").exists())
+
+    def test_supervise_is_hidden_from_public_help(self):
+        proc = run(["--help"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("_supervise", proc.stdout)
+        for command in ["run", "ls", "logs", "open", "stop", "rm"]:
+            self.assertIn(command, proc.stdout)
+
+    def test_stop_running_workspace_marks_stopped(self):
+        proc = run(["run", "--agent", "slow", "--branch", "task/slow", "--prompt", "prompt.txt", "--detach"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_for_status("task-slow", "running")
+        stop_proc = run(["stop", "task-slow"], self.repo)
+        self.assertEqual(stop_proc.returncode, 0, stop_proc.stderr)
+        self.assertIn("stopped workspace: task-slow", stop_proc.stdout)
+        ws = self.workspace("task-slow")
+        self.assertEqual(ws["status"], "stopped")
+        self.assertEqual(ws["run"]["pid"], None)
+        self.assertIn(ws["run"]["exit_code"], [128 + 15, 128 + 9])
+
+    def test_non_zero_agent_exit_becomes_failed(self):
+        proc = run(["run", "--agent", "fail", "--branch", "task/fail", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 7)
+        self.assertIn("fail agent ran", proc.stdout)
+        ws = self.workspace("task-fail")
+        self.assertEqual(ws["status"], "failed")
+        self.assertEqual(ws["run"]["exit_code"], 7)
+
+    def test_prompt_can_be_read_from_stdin(self):
+        proc = run(["run", "--agent", "stdin", "--branch", "task/stdin", "--prompt", "-"], self.repo, input_text="from stdin\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("stdin=from stdin", proc.stdout)
+        ws = self.workspace("task-stdin")
+        self.assertEqual(ws["prompt"]["source"], "stdin")
+        self.assertEqual(ws["prompt"]["ref"], None)
+        self.assertTrue((self.repo / "task-stdin").exists() is False)
+        self.assertEqual((self.repo / ".maestro" / "logs" / "task-stdin" / "prompt.txt").read_text(), "from stdin\n")
+
+    def test_rm_delete_branch_removes_branch(self):
+        proc = run(["run", "--agent", "fake", "--branch", "task/delete-me", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rm_proc = run(["rm", "task-delete-me", "--delete-branch"], self.repo)
+        self.assertEqual(rm_proc.returncode, 0, rm_proc.stderr)
+        self.assertIn("removed worktree and branch task/delete-me", rm_proc.stdout)
+        self.assertNotEqual(git(self.repo, "rev-parse", "--verify", "refs/heads/task/delete-me", check=False).returncode, 0)
+
+    def test_dirty_worktree_blocks_rm_without_force(self):
+        proc = run(["run", "--agent", "fake", "--branch", "task/dirty", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        worktree = Path(run(["open", "task-dirty"], self.repo).stdout.strip())
+        (worktree / "dirty.txt").write_text("dirty\n")
+        rm_proc = run(["rm", "task-dirty"], self.repo)
+        self.assertNotEqual(rm_proc.returncode, 0)
+        self.assertIn("worktree has uncommitted changes", rm_proc.stderr)
+        self.assertTrue(worktree.exists())
+        self.assertEqual(self.workspace("task-dirty")["status"], "completed")
+
+    def test_missing_worktree_reconciles_to_orphaned(self):
+        proc = run(["run", "--agent", "fake", "--branch", "task/orphan", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        worktree = Path(run(["open", "task-orphan"], self.repo).stdout.strip())
+        git(self.repo, "worktree", "remove", "--force", str(worktree))
+        ls_proc = run(["--json", "ls"], self.repo)
+        self.assertEqual(ls_proc.returncode, 0, ls_proc.stderr)
+        ws = next(item for item in json.loads(ls_proc.stdout) if item["id"] == "task-orphan")
+        self.assertEqual(ws["status"], "orphaned")
+
+    def test_invalid_recipe_fails_before_creating_worktree(self):
+        self.write_config(
+            f"""\
+            [agents.invalid]
+            command = "{self.fake_agent}"
+            args = []
+            prompt_via = "arg"
+            """
+        )
+        proc = run(["run", "--agent", "invalid", "--branch", "task/invalid", "--prompt", "prompt.txt"], self.repo)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("must contain exactly one {prompt}", proc.stderr)
+        self.assertFalse((self.repo / ".maestro" / "worktrees" / "task-invalid").exists())
+        self.assertNotEqual(git(self.repo, "rev-parse", "--verify", "refs/heads/task/invalid", check=False).returncode, 0)
+
+    def test_corrupt_state_is_backed_up_before_run_recreates_state(self):
+        state_path = self.repo / ".maestro" / "state.json"
+        state_path.write_text("{not json")
+        proc = run(["run", "--agent", "fake", "--branch", "task/corrupt-state", "--prompt", "prompt.txt"], self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        backups = list((self.repo / ".maestro").glob("state.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(self.workspace("task-corrupt-state")["status"], "completed")
 
 
 if __name__ == "__main__":
